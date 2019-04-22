@@ -7,6 +7,10 @@ import configparser
 from argparse import ArgumentParser
 from string import Template
 from datetime import datetime
+import copy
+
+NAME = "(?<=nginx-access-ui\.log-)\d+"
+EXT = "(?<=\d{8}).*"
 
 
 def xmean(vals):
@@ -36,44 +40,51 @@ def xmedian(vals):
         return (float(lower + upper)) / 2
 
 
-def fresh_log(logpath, reportpath, name_p, ext_p):
+def fresh_log(logpath, name_p, ext_p):
     """
     Finds the most recent file in the path.
     :param logpath: config path to log files
-    :param reportpath:  config path to report files
     :param name_p: pattern for re to extract date from filename
     :param ext_p: pattern for re to extract extension from filename
     :return:
     """ 
     files = os.listdir(logpath)
+
+    # find latest file
+    found_files = []
+    compiled = re.compile(name_p)
+    for f in files:
+        if "nginx-access-ui.log" in f:  # select only log with particular filename
+            string_date = compiled.findall(f)[0]
+            number_date = datetime.strptime(string_date, "%Y%m%d")
+            filepath = os.path.join(logpath, f)
+            found_files.append({"date": number_date,
+                                "filepath": filepath})
+    latest_file = sorted(found_files, key=lambda k: k["date"], reverse=True)[0]
+
+    return latest_file
+
+
+def check_report(file_candidate, reportpath):
+    """
+    Checks whether the report has been constructed before
+    :param file_candidate: dict with file params to check
+    :param reportpath: path to report files
+    """
     reports = os.listdir(reportpath)
 
     # extract dates from report names
-    report_dates = list()
+    report_dates = []
     for rep in reports:
         p = "(?<=report-).*(?=\.)"
         rep_date = re.findall(p, rep)[0]
         num_rep_date = datetime.strptime(rep_date, "%Y.%m.%d")
         report_dates.append(num_rep_date)
 
-    # find latest file
-    lst = list()
-    for f in files:
-        if "nginx-access-ui.log" in f:  # select only log with particular filename
-            string_date = re.compile(name_p).findall(f)[0]
-            extension = re.compile(ext_p).findall(f)[0]
-            number_date = datetime.strptime(string_date, "%Y%m%d")
-            filepath = logpath + "/" + f
-            lst.append({"date": number_date,
-                        "extension": extension,
-                        "filepath": filepath})
-    latest_file = sorted(lst, key=lambda k: k["date"], reverse=True)[0]
-
-    # check whether the report has been constructed before
-    if latest_file["date"] in report_dates:
+    if file_candidate["date"] in report_dates:
         return False
     else:
-        return latest_file
+        return file_candidate
 
 
 def open_log(filedict):
@@ -82,21 +93,17 @@ def open_log(filedict):
     :param filedict: dict with parameters of required file
     """
     path = filedict["filepath"]
-    extension = filedict["extension"]
 
-    if extension == ".gz":
+    if ".gz" in filedict["filepath"]:
         log = gzip.open(path, "r")
         return log
-    elif extension == "":
+    else:
         try:
             log = open(path)
             return log
         except IOError as e:
             logging.error(e)
             raise
-    else:
-        logging.error("File has wrong extension")
-        raise IOError
 
 
 def line_parse(log):
@@ -119,7 +126,7 @@ def make_simple_dict(log):
     :param log: file with server logs.
     """
     lines = line_parse(log)
-    storage = dict()
+    storage = {}
     counter = 0  # for logging purposes
     error_counter = 0
 
@@ -150,12 +157,12 @@ def make_stats_dict(mydict):
     Preprocess simple dict with a list of request times into dict with url stats
     :param mydict: dict with requests times.
     """
-    newdict = dict()
+    newdict = {}
     total_count = 0
     total_time = 0
     for key in mydict.keys():
         values = mydict[key]["times"]
-        newdict[key] = dict()
+        newdict[key] = {}
         newdict[key]["time_sum"] = sum(values)
         newdict[key]["time_max"] = max(values)
         newdict[key]["time_avg"] = xmean(values)
@@ -177,9 +184,9 @@ def pretty_list(d, max_length=1000):
     :param max_length: number of urls to return
     :return: [{"url": url1, "time_sum": 1, ...}, {"url": url2, "time_sum": 3, ...}]
     """
-    pretty = list()
+    pretty = []
     for key in d.keys():
-        mini = dict()
+        mini = {}
         mini["url"] = key
         mini["time_sum"] = round(d[key]["time_sum"], 3)
         mini["time_max"] = round(d[key]["time_max"], 3)
@@ -197,44 +204,71 @@ def pretty_list(d, max_length=1000):
     else:
         return pretty
 
+    
+def save_report(templatepath, reportpath, pretty_list, report_date):
+    """
+    Saves report in .html.
 
-def main(logpath, reportpath, report_size, error_limit, templatepath, name_p, ext_p):
+    """
+    # read html template
+    html = open(templatepath, "r", encoding='utf-8').read()
+    s = Template(html)
+    subs_dict = {"table_json": pretty_list}
+    report = s.safe_substitute(subs_dict)
+    try:
+        with open(reportpath + "/report-" + datetime.strftime(report_date, "%Y.%m.%d") + ".html", "w") as f:
+            f.write(report)
+        return True
+    except OSError:
+        logging.error(e)
+        raise
+    
+
+
+def main(config):
     """
     Opens log, calculates statistics, renders .html report, saves report into ./reports folder.
     :return:
     """
+
+    # unpack config
+    logpath = config["log_dir"]
+    reportpath = config["report_dir"]
+    report_size = config["report_size"]
+    error_limit = config["error_limit"]
+    templatepath = config["template"]
+
     # parse log file
-    f = fresh_log(logpath=logpath, reportpath=reportpath, name_p=name_p, ext_p=ext_p)
+    fresh = fresh_log(logpath=logpath, name_p=NAME, ext_p=EXT)
+    check_result = check_report(file_candidate=fresh, reportpath=reportpath)
     logging.info("File has been read.")
     # ensure there is no report for the fresh log file
-    if f:
-        log = open_log(f)
-        storage, error_rate = make_simple_dict(log)
-        logging.info("Simple dictionary has been constructed.")
-
-        if error_rate > float(error_limit):
-            logging.info("Parsing error rate is too high (%d%%) " % round(100*error_rate, 3))
-            sys.exit(0)
-        else:
-            logging.info("Parsing error rate is (%d%%) " % round(100*error_rate, 3))
-
-        # calculate statistics
-        stats_dict = make_stats_dict(storage)
-        logging.info("Statistics dictionary has been constructed.")
-
-        pretty = pretty_list(stats_dict, max_length=report_size)
-
-        # read html template
-        html = open(templatepath, "r", encoding='utf-8').read()
-        s = Template(html)
-        subs_dict = {"table_json": pretty}
-        report = s.safe_substitute(subs_dict)
-        with open(reportpath + "/report-" + datetime.strftime(f["date"], "%Y.%m.%d") + ".html", "w") as f:
-            f.write(report)
-        logging.info("Report has been successfully constructed.")
-    else:
+    if not check_result:
         logging.info("Report has been constructed before. Check ./reports folder.")
         sys.exit(0)
+    
+    log = open_log(check_result)
+    storage, error_rate = make_simple_dict(log)
+    logging.info("Simple dictionary has been constructed.")
+
+    if error_rate > float(error_limit):
+        logging.info("Parsing error rate is too high (%d%%) " % round(100*error_rate, 3))
+        sys.exit(0)
+    else:
+        logging.info("Parsing error rate is (%d%%) " % round(100*error_rate, 3))
+
+    # calculate statistics
+    stats_dict = make_stats_dict(storage)
+    logging.info("Statistics dictionary has been constructed.")
+
+    pretty = pretty_list(stats_dict, max_length=report_size)
+
+    # save to html
+    written = save_report(templatepath, reportpath, pretty, report_date=check_result["date"])
+
+    if written:
+        logging.info("Report has been successfully constructed.")
+    
 
 
 if __name__ == "__main__":
@@ -243,9 +277,8 @@ if __name__ == "__main__":
     NAME = "(?<=nginx-access-ui\.log-)\d+"
     EXT = "(?<=\d{8}).*"
 
-
     # dealing with configs
-    config_dict = {
+    DEFAULT_CONF = {
         "report_size": 1000,
         "report_dir": "./reports",
         "log_dir": "./server_logs",
@@ -254,51 +287,33 @@ if __name__ == "__main__":
         "template": "./config/report.html"
     }
 
+    default_config = copy.deepcopy(DEFAULT_CONF)
+
     parser = ArgumentParser()
-    parser.add_argument("-config", "--config", dest="config", help="Open specified file")
+    parser.add_argument(
+        "-config", 
+        "--config", 
+        dest="config", 
+        help="Open specified file",
+        default=default_config)
+
     args = parser.parse_args()
-    conf = args.config
-    if conf:
-        config = configparser.ConfigParser()
-        config.read(conf)
-    else:
-        config = config_dict
-    
 
-    # construction of correct config dict
-    if len(config) != 0:
-        for k in config.keys():
-            if k in config_dict.keys():
-                config_dict[k] = config[k]
-            else:
-                config_dict[k] = config[k]
-        config = config_dict
-    else:
-        raise FileNotFoundError
-
+    if args.config:
+        default_config.update(args.config)
 
     # logging depending on config
-    if "logging" in config.keys():
-        logging.basicConfig(format="[%(asctime)s] %(levelname).1s %(message)s:%(lineno)d",
-                            level=logging.DEBUG,
-                            # filename=config["logging"])
-                            filename="./logs/log_analizer.log")
-    else:
-        logging.basicConfig(format="[%(asctime)s] %(levelname).1s %(message)s:%(lineno)d",
-                            level=logging.DEBUG,
-                            filename=None)
+    logging_destination = default_config.get("logging", "./logs/log_analizer.log")
+    logging.basicConfig(format="[%(asctime)s] %(levelname).1s %(message)s:%(lineno)d",
+                        level=logging.DEBUG,
+                        filename=logging_destination)
 
-
-    # main actions
     try:
+        import cProfile
 
-        main(logpath=config["log_dir"], 
-             reportpath=config["report_dir"], 
-             error_limit=config["error_limit"], 
-             report_size = int(config["report_size"]),
-             templatepath=config["template"],
-             name_p=NAME, 
-             ext_p=EXT)
+        cProfile.run(
+            '''main(config=default_config)'''
+        )
 
     except KeyboardInterrupt as k:
          logging.exception(k)
